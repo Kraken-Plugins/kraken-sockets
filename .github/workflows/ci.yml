@@ -1,0 +1,89 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-and-test:
+    environment: prod
+    runs-on: ubuntu-latest
+    container:
+      image: cimg/go:1.24.4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore Go modules cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-
+
+      - name: Download Go Modules
+        env:
+          GITHUB_USER: ${{ secrets.GITHUB_USER }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          go env -w GOPRIVATE=github.com/cbartram
+          git config --global url."https://$GITHUB_USER:$GITHUB_TOKEN@github.com/cbartram/".insteadOf "https://github.com/cbartram/"
+          go mod download
+
+      - name: Build Go Binary
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o main main.go
+
+      - name: Run Tests
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -v ./...
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment: prod
+    needs: build-and-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USER }}/kraken-sockets:1.0.${{ github.run_number }}
+            ${{ secrets.DOCKER_USER }}/kraken-sockets:latest
+
+      - name: Install ArgoCD CLI
+        run: |
+          URL=https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo curl --insecure -sSL -o /usr/local/bin/argocd $URL
+          sudo chmod +x /usr/local/bin/argocd
+
+      - name: Login to ArgoCD
+        run: |
+          argocd login kraken-plugins.com --insecure \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --grpc-web --grpc-web-root-path /argocd
+
+      - name: Deploy to ArgoCD
+        run: |
+          VERSION_TAG="1.0.${{ github.run_number }}"
+          argocd app set kraken-sockets -p image.tag=$VERSION_TAG --grpc-web
+          argocd app sync kraken-sockets --grpc-web --prune
+
+      - name: Wait for deployment
+        run: argocd app wait kraken-sockets --grpc-web
