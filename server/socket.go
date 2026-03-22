@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -28,6 +29,7 @@ type Client struct {
 	name          string
 	encryptedName string
 	room          string
+	once          sync.Once
 	lastActive    time.Time
 	writer        *bufio.Writer
 	reader        *bufio.Reader
@@ -264,11 +266,11 @@ func processClientMessages(client *Client, room *Room) {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			log.Errorf("client %s disconnected: %v", client.name, err)
-			notifyLeave(room, client)
+			client.once.Do(func() { notifyLeave(room, client) })
 			return
 		}
 
-		// Reset the client's last active time
+		// Only reset lastActive after a confirmed successful read
 		client.lastActive = time.Now()
 
 		// Handle empty heartbeat packets
@@ -305,7 +307,13 @@ func processClientMessages(client *Client, room *Room) {
 					log.Errorf("error flushing join packet for client: %s, %v", c.name, err)
 				}
 			}
-
+		case PacketLeave:
+			log.Infof("client %s sent graceful LEAVE", client.name)
+			client.once.Do(func() {
+				notifyLeave(room, client)
+			})
+			client.conn.Close()
+			return // exits processClientMessages goroutine cleanly
 		default:
 			log.Infof("unknown packet header: %s", header)
 		}
@@ -323,7 +331,9 @@ func monitorConnection(client *Client, room *Room) {
 		// Check if the client is still active
 		if time.Since(client.lastActive) > 45*time.Second {
 			log.Infof("socket client %s timed out", client.name)
-			notifyLeave(room, client)
+			client.once.Do(func() {
+				notifyLeave(room, client)
+			})
 			client.conn.Close()
 			return
 		}
