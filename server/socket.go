@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -30,9 +31,16 @@ type Client struct {
 	encryptedName string
 	room          string
 	once          sync.Once
-	lastActive    time.Time
-	writer        *bufio.Writer
-	reader        *bufio.Reader
+	// lastActive stores Unix nanoseconds and is accessed atomically
+	// to prevent a data race between processClientMessages (writer)
+	// and monitorConnection (reader).
+	lastActive int64
+	writer     *bufio.Writer
+	reader     *bufio.Reader
+	// done is closed by processClientMessages when it exits (for any
+	// reason). monitorConnection selects on it so it stops immediately
+	// rather than continuing to poll a client that is already gone.
+	done chan struct{}
 }
 
 // Room represents a group of connected clients
@@ -106,9 +114,10 @@ func handleClient(conn net.Conn, server *SocketServer) {
 
 	client := &Client{
 		conn:       conn,
-		lastActive: time.Now(),
+		lastActive: time.Now().UnixNano(),
 		writer:     writer,
 		reader:     reader,
+		done:       make(chan struct{}),
 	}
 
 	// Wait for initial join packet
@@ -152,19 +161,14 @@ func handleClient(conn net.Conn, server *SocketServer) {
 	client.room = roomID
 	client.encryptedName = encryptedName
 
-	// Decrypt the player name for server-side logging
-	// TODO The room id is SHA256 encrypted but we can't decrypt it correctly? so then we cant decrypt player names correctly
-	// etc... gotta figure out how this works.
-
-	//password := strings.Replace(roomID, Hash(PasswordSalt), "", 1)
-	//key := password + PasswordSalt
 	client.name = DecryptAES(roomID, encryptedName)
 
 	log.Infof("player %s joined room %s", client.name, roomID)
 	room.addClient(client)
 	notifyJoin(room, client)
 
-	// Process messages from the client
+	// processClientMessages owns the done channel and closes it on exit.
+	// monitorConnection selects on done so it exits at the same time.
 	go processClientMessages(client, room)
 	go monitorConnection(client, room)
 }
@@ -250,15 +254,24 @@ func notifyLeave(room *Room, leavingClient *Client) {
 	}
 }
 
-// Process messages from a client
+// Process messages from a client.
+// This function owns client.done and closes it on exit so that
+// monitorConnection stops at the same time.
 func processClientMessages(client *Client, room *Room) {
+	// Always signal the monitor to stop when this goroutine exits,
+	// regardless of whether it was a graceful leave, a read error,
+	// or a deadline timeout.
+	defer close(client.done)
+
 	for {
-		// Read a line from the client
 		conn := client.conn
 		reader := client.reader
 
-		// Set a read deadline for detecting disconnects
-		err := conn.SetReadDeadline(time.Now().Add(35 * time.Second))
+		// Set a read deadline. If no data (including a heartbeat) arrives
+		// within 40 s the connection is considered dead and we exit.
+		// The client sends a heartbeat every 30 s so 40 s gives a comfortable
+		// margin without waiting as long as the monitor's 45 s window.
+		err := conn.SetReadDeadline(time.Now().Add(40 * time.Second))
 		if err != nil {
 			log.Errorf("failed to set read deadline: %v", err)
 		}
@@ -270,10 +283,11 @@ func processClientMessages(client *Client, room *Room) {
 			return
 		}
 
-		// Only reset lastActive after a confirmed successful read
-		client.lastActive = time.Now()
+		// Update last-active atomically so monitorConnection always sees
+		// a consistent value without a data race on the time.Time struct.
+		atomic.StoreInt64(&client.lastActive, time.Now().UnixNano())
 
-		// Handle empty heartbeat packets
+		// Handle empty heartbeat packets — lastActive is already refreshed above.
 		if len(strings.TrimSpace(line)) == 0 {
 			continue
 		}
@@ -320,22 +334,28 @@ func processClientMessages(client *Client, room *Room) {
 	}
 }
 
-// Monitor the client connection
+// monitorConnection watches for idle clients. It exits as soon as
+// processClientMessages closes client.done, preventing spurious
+// "timed out" log lines for clients that already disconnected cleanly.
 func monitorConnection(client *Client, room *Room) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-
-		// Check if the client is still active
-		if time.Since(client.lastActive) > 45*time.Second {
-			log.Infof("socket client %s timed out", client.name)
-			client.once.Do(func() {
-				notifyLeave(room, client)
-			})
-			client.conn.Close()
+		select {
+		case <-client.done:
+			// processClientMessages already handled the disconnect.
 			return
+		case <-ticker.C:
+			lastActive := time.Unix(0, atomic.LoadInt64(&client.lastActive))
+			if time.Since(lastActive) > 45*time.Second {
+				log.Infof("socket client %s timed out", client.name)
+				client.once.Do(func() {
+					notifyLeave(room, client)
+				})
+				client.conn.Close()
+				return
+			}
 		}
 	}
 }
