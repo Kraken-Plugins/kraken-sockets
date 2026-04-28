@@ -9,5 +9,6 @@ spec:
     app: {{.Values.name}}
   ports:
     - port: {{.Values.service.port}}
+      targetPort: {{.Values.service.targetPort}}
       protocol: TCP
       name: http
