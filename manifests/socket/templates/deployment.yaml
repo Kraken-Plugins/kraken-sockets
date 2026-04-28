@@ -30,6 +30,6 @@ spec:
             - "0.0.0.0"
           ports:
             - containerPort: {{.Values.service.targetPort}}
-              name: tcp
+              name: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

@@ -10,5 +10,4 @@ spec:
   ports:
     - port: {{.Values.service.port}}
       protocol: TCP
-      name: tcp
-
+      name: http

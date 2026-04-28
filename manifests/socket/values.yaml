@@ -11,8 +11,8 @@ serviceAccountName: kraken-api-sa
 
 service:
   type: ClusterIP
-  port: 26388
-  targetPort: 26388
+  port: 80
+  targetPort: 8080
 
 resources:
   limits:
