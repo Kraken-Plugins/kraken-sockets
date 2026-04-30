@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -40,9 +42,13 @@ type Client struct {
 	name          string
 	encryptedName string
 	room          string
+	remoteAddr    string
+	forwardedFor  string
+	userAgent     string
 	once          sync.Once
 	writeMutex    sync.Mutex
 	lastActive    int64
+	connectedAt   int64
 	done          chan struct{}
 }
 
@@ -113,9 +119,13 @@ func handleClient(w http.ResponseWriter, r *http.Request, server *SocketServer) 
 	}
 
 	client := &Client{
-		conn:       conn,
-		lastActive: time.Now().UnixNano(),
-		done:       make(chan struct{}),
+		conn:         conn,
+		remoteAddr:   r.RemoteAddr,
+		forwardedFor: r.Header.Get("X-Forwarded-For"),
+		userAgent:    r.UserAgent(),
+		lastActive:   time.Now().UnixNano(),
+		connectedAt:  time.Now().UnixNano(),
+		done:         make(chan struct{}),
 	}
 
 	conn.SetReadLimit(maxMessageSize)
@@ -125,6 +135,20 @@ func handleClient(w http.ResponseWriter, r *http.Request, server *SocketServer) 
 		_ = conn.Close()
 		return
 	}
+
+	defaultCloseHandler := conn.CloseHandler()
+	conn.SetCloseHandler(func(code int, text string) error {
+		log.Infof(
+			"client %s received close frame code=%d text=%q remote=%s forwarded_for=%s",
+			client.displayName(),
+			code,
+			text,
+			client.remoteAddr,
+			client.forwardedFor,
+		)
+
+		return defaultCloseHandler(code, text)
+	})
 
 	conn.SetPongHandler(func(string) error {
 		atomic.StoreInt64(&client.lastActive, time.Now().UnixNano())
@@ -178,7 +202,14 @@ func initializeClient(client *Client, server *SocketServer) (*Room, error) {
 	client.encryptedName = encryptedName
 	client.name = DecryptAES(roomID, encryptedName)
 
-	log.Infof("player %s joined room %s", client.name, roomID)
+	log.Infof(
+		"player %s joined room %s remote=%s forwarded_for=%s user_agent=%q",
+		client.name,
+		roomID,
+		client.remoteAddr,
+		client.forwardedFor,
+		client.userAgent,
+	)
 	room.addClient(client)
 	notifyJoin(room, client)
 
@@ -229,6 +260,63 @@ func (c *Client) sendPing() error {
 	}
 
 	return c.conn.WriteControl(websocket.PingMessage, nil, deadline)
+}
+
+func (c *Client) displayName() string {
+	if c.name != "" {
+		return c.name
+	}
+
+	if c.encryptedName != "" {
+		return c.encryptedName
+	}
+
+	return c.remoteAddr
+}
+
+func (c *Client) connectionDuration() time.Duration {
+	connectedAt := atomic.LoadInt64(&c.connectedAt)
+	if connectedAt == 0 {
+		return 0
+	}
+
+	return time.Since(time.Unix(0, connectedAt))
+}
+
+func logDisconnect(client *Client, err error) {
+	fields := log.Fields{
+		"client":         client.displayName(),
+		"room":           client.room,
+		"remote":         client.remoteAddr,
+		"forwarded_for":  client.forwardedFor,
+		"user_agent":     client.userAgent,
+		"connection_age": client.connectionDuration().String(),
+	}
+
+	var closeErr *websocket.CloseError
+	switch {
+	case errors.As(err, &closeErr):
+		fields["close_code"] = closeErr.Code
+		fields["close_text"] = closeErr.Text
+
+		if closeErr.Code == websocket.CloseAbnormalClosure {
+			log.WithFields(fields).Warnf("websocket closed without close frame: %v", err)
+			return
+		}
+
+		log.WithFields(fields).Infof("websocket closed: %v", err)
+	case errors.Is(err, io.EOF), strings.Contains(err.Error(), "unexpected EOF"):
+		log.WithFields(fields).Warnf("websocket connection dropped unexpectedly: %v", err)
+	case isTimeoutError(err):
+		log.WithFields(fields).Warnf("websocket connection timed out: %v", err)
+	default:
+		log.WithFields(fields).Errorf("client disconnected: %v", err)
+	}
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // Send a join notification to all clients in a room.
@@ -287,7 +375,7 @@ func processClientMessages(client *Client, room *Room) {
 	for {
 		messageType, payload, err := client.conn.ReadMessage()
 		if err != nil {
-			log.Errorf("client %s disconnected: %v", client.name, err)
+			logDisconnect(client, err)
 			client.once.Do(func() { notifyLeave(room, client) })
 			return
 		}
