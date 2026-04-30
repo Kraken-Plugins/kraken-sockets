@@ -12,5 +12,5 @@ func main() {
 	flag.StringVar(&host, "host", "0.0.0.0", "host to listen on")
 	flag.Parse()
 
-	server.RegisterNewSocketServer(host, port)
+	server.Listen(host, port)
 }

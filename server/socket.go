@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,10 +12,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
-)
-
-const (
-	PasswordSalt = "9#jx[VHk_<44nK$%0PbOTCcJA6Jy(o"
 )
 
 const (
@@ -59,27 +56,6 @@ type Room struct {
 type SocketServer struct {
 	rooms map[string]*Room
 	mutex sync.RWMutex
-}
-
-func NewSocketServer() *SocketServer {
-	return &SocketServer{
-		rooms: make(map[string]*Room),
-	}
-}
-
-func newHTTPHandler(server *SocketServer) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-			return
-		}
-
-		handleClient(w, r, server)
-	})
-
-	return mux
 }
 
 // Get or create a room.
@@ -400,18 +376,33 @@ func monitorConnection(client *Client, room *Room) {
 	}
 }
 
-func RegisterNewSocketServer(host, port string) {
-	server := NewSocketServer()
+// Listen Registers a new socket server listening on the defined host and port.
+func Listen(host, port string) {
+	server := &SocketServer{
+		rooms: make(map[string]*Room),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+
+		handleClient(w, r, server)
+	})
+
 	address := fmt.Sprintf("%s:%s", host, port)
 	httpServer := &http.Server{
 		Addr:              address,
-		Handler:           newHTTPHandler(server),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	log.Infof("websocket server started on %s", address)
 	err := httpServer.ListenAndServe()
-	if err != nil && err != http.ErrServerClosed {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("failed to start websocket server on %s err: %v", address, err)
 	}
 }

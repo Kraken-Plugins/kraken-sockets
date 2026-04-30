@@ -1,6 +1,7 @@
 package server
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
@@ -11,8 +12,22 @@ import (
 )
 
 func TestWebsocketServerJoinBroadcastLeaveFlow(t *testing.T) {
-	socketServer := NewSocketServer()
-	testServer := httptest.NewServer(newHTTPHandler(socketServer))
+	socketServer := &SocketServer{
+		rooms: make(map[string]*Room),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+
+		handleClient(w, r, socketServer)
+	})
+
+	testServer := httptest.NewServer(mux)
 	defer testServer.Close()
 
 	websocketURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
