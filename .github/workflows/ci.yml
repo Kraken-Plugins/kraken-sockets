@@ -85,7 +85,7 @@ jobs:
           argocd login ${{ secrets.ARGOCD_SERVER }} \
             --username ${{ secrets.ARGOCD_USERNAME }} \
             --password ${{ secrets.ARGOCD_PASSWORD }} \
-            --grpc-web --grpc-web-root-path /argocd
+            --grpc-web
 
       - name: Deploy to ArgoCD
         run: |
